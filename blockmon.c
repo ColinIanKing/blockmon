@@ -49,7 +49,6 @@
 #define MINIMUM(a, b)		((a) < (b) ? (a) : (b))
 
 #define DEFAULT_UDELAY		(15000)	/* Delay between each refresh */
-#define BLINK_MASK		(0x20)	/* Cursor blink counter mask */
 
 
 /*
@@ -108,20 +107,6 @@ typedef struct blk {
 	uint32_t	count;
 	uint32_t	age;
 } blk_t;
-
-/*
- *  Cursor context, we have one each for the
- *  memory map and page contents views
- */
-typedef struct {
-	int32_t xpos;			/* Cursor x position */
-	int32_t ypos;			/* Cursor y position */
-	int32_t xpos_prev;		/* Previous x position */
-	int32_t ypos_prev;		/* Previous y position */
-	int32_t ypos_max;		/* Max y position */
-	int32_t xmax;			/* Width */
-	int32_t ymax;			/* Height */
-} position_t;
 
 /*
  *  Globals, stashed in a global struct
@@ -285,10 +270,10 @@ static void blks_age(void)
 }
 
 
-static void blks_dump(position_t *position)
+static void blks_dump(void)
 {
 	blk_t *blk = g.blk_list;
-	const size_t nblocks = position->xmax * position->ymax;
+	const size_t nblocks = (COLS) * (LINES - 2);
 	double blks_per_map = (float)g.nblocks / (float)nblocks;
 	uint32_t map_age[nblocks];
 	uint32_t map_count[nblocks];
@@ -311,8 +296,8 @@ static void blks_dump(position_t *position)
 	}
 
 	wattrset(g.mainwin, COLOR_PAIR(WHITE_BLUE));
-	for (i = 0, y = 0; y < position->ymax; y++) {
-		for (x = 0; x < position->xmax; x++) {
+	for (i = 0, y = 0; y < (LINES - 2); y++) {
+		for (x = 0; x < (COLS); x++) {
 			char ch = '.';
 			int colour = 4;
 			if (map_age[i]) {
@@ -429,31 +414,6 @@ static inline void show_help(void)
 		" Cursor keys move Up/Down/Left/Right%7s", "");
 }
 
-/*
- *  update_xymax()
- *	set the xymax scale for a specific view v
- *	based on column width and scaling factor for
- *	page or mem (hex) views
- */
-static inline void update_xymax(position_t *position)
-{
-	position->xmax = COLS - 1;
-	position->ymax = LINES - 2;
-}
-
-/*
- *  reset_cursor()
- *	reset to home position
- */
-static inline void reset_cursor(
-	position_t *p,
-	index_t *data_index)
-{
-	p->xpos = 0;
-	p->ypos = 0;
-	*data_index = 0;
-}
-
 static inline int get_fs_info(const char *path)
 {
 	struct stat buf;
@@ -477,9 +437,6 @@ int main(int argc, char **argv)
 {
 	struct sigaction action;
 	useconds_t udelay;
-	position_t position;
-	index_t data_index, prev_data_index;
-	int32_t blink;
 	int rc, ret;
 	pthread_t reader;
 
@@ -489,9 +446,7 @@ int main(int argc, char **argv)
 	}
 
 	rc = OK;
-	blink = 0;
 	udelay = DEFAULT_UDELAY;
-	data_index = 0;
 
 	for (;;) {
 		int c = getopt(argc, argv, "ad:hp:rt:vz:");
@@ -578,15 +533,10 @@ int main(int argc, char **argv)
 	init_pair(BLACK_BLACK, COLOR_BLACK, COLOR_BLACK);
 	init_pair(BLUE_WHITE, COLOR_BLUE, COLOR_WHITE);
 
-	memset(&position, 0, sizeof(position));
-	update_xymax(&position);
-
 	trace_block_enable(1);
 
 	for (;;) {
-		int ch, blink_attrs;
-		char cursor_ch;
-
+		int ch;
 
 		/*
 		 *  SIGWINCH window resize triggered so
@@ -594,8 +544,6 @@ int main(int argc, char **argv)
 		 */
 		if (g.resized) {
 			int newx, newy;
-			const index_t cursor_index = data_index +
-				(position.xpos + (position.ypos * position.xmax));
 			struct winsize ws;
 
 			if (ioctl(fileno(stdin), TIOCGWINSZ, &ws) < 0) {
@@ -618,9 +566,6 @@ int main(int argc, char **argv)
 
 			wbkgd(g.mainwin, COLOR_PAIR(RED_BLUE));
 			g.resized = false;
-			position.xpos = 0;
-			position.ypos = 0;
-			data_index = cursor_index;
 		}
 
 		/*
@@ -638,35 +583,8 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		update_xymax(&position);
 		wbkgd(g.mainwin, COLOR_PAIR(RED_BLUE));
 
-		blink++;
-		{
-			int32_t curxpos = position.xpos;
-			const position_t *pc = &position;
-			const index_t cursor_index = data_index +
-				(pc->xpos + (pc->ypos * pc->xmax));
-
-			/* Memory may have shrunk, so check this */
-			if (cursor_index >= (index_t)g.nblocks) {
-				/* Force end of memory key action */
-				ch = KEY_END;
-				goto force_ch;
-			}
-
-			blink_attrs = A_BOLD | ((blink & BLINK_MASK) ?
-				COLOR_PAIR(WHITE_BLUE) :
-				COLOR_PAIR(BLUE_WHITE));
-			wattrset(g.mainwin, blink_attrs);
-			cursor_ch = mvwinch(g.mainwin, position.ypos + 1, curxpos)
-				& A_CHARTEXT;
-			mvwprintw(g.mainwin, position.ypos + 1, curxpos,
-				"%c", cursor_ch);
-			blink_attrs = A_BOLD | ((blink & BLINK_MASK) ?
-				COLOR_PAIR(BLACK_WHITE) :
-				COLOR_PAIR(WHITE_BLACK));
-		}
 		ch = getch();
 
 		if (g.help_view)
@@ -680,15 +598,11 @@ int main(int argc, char **argv)
 			MAJOR(g.dev), MINOR(g.dev),
 			g.nblocks, g.blksize);
 
-		blks_dump(&position);
+		blks_dump();
 		blks_age();
 
 		wrefresh(g.mainwin);
 		refresh();
-force_ch:
-		prev_data_index = data_index;
-		position.xpos_prev = position.xpos;
-		position.ypos_prev = position.ypos;
 
 		switch (ch) {
 		case 27:	/* ESC */
@@ -706,85 +620,8 @@ force_ch:
 			/* Clear pop ups */
 			g.help_view = false;
 			break;
-		case KEY_DOWN:
-			blink = 0;
-			position.ypos++;
-			break;
-		case KEY_UP:
-			blink = 0;
-			position.ypos--;
-			break;
-		case KEY_LEFT:
-			blink = 0;
-			position.xpos--;
-			break;
-		case KEY_RIGHT:
-			blink = 0;
-			position.xpos++;
-			break;
-		case KEY_NPAGE:
-			blink = 0;
-			position.ypos += position.ymax / 2;
-			break;
-		case KEY_PPAGE:
-			blink = 0;
-			position.ypos -= position.ymax / 2;
-			break;
-		case KEY_HOME:
-			reset_cursor(&position, &data_index);
-			break;
-		case KEY_END:
-			break;
 		}
 
-		position.ypos_max = position.ymax;
-
-		if (position.xpos >= position.xmax) {
-			position.xpos = 0;
-			position.ypos++;
-		}
-		if (position.xpos < 0) {
-			position.xpos = position.xmax - 1;
-			position.ypos--;
-		}
-
-		/*
-		 *  Handling yposition overflow / underflow
-		 *  is non-trivial as we need to consider
-		 *  different views and how to handle the
-		 *  scroll data and page index offsets
-		 */
-		if (position.ypos > position.ymax - 1) {
-			data_index += position.xmax *
-				(position.ypos - (position.ymax - 1));
-			position.ypos = position.ymax - 1;
-		}
-		if (position.ypos < 0) {
-			data_index -= position.xmax * (-position.ypos);
-			position.ypos = 0;
-			if (data_index < 0) {
-				data_index = 0;
-			}
-		}
-		if (data_index < 0) {
-			data_index = 0;
-			position.ypos = 0;
-		}
-		{
-			const position_t *pc = &position;
-			const index_t cursor_index = data_index +
-				(pc->xpos + (pc->ypos * pc->xmax));
-			const blkaddr_t addr =
-				(cursor_index >= (index_t)g.nblocks) ?
-					g.nblocks :
-					(blkaddr_t)data_index + (position.xpos + (position.ypos * position.xmax));
-
-			if (addr >= g.nblocks) {
-				data_index = prev_data_index;
-				position.xpos = position.xpos_prev;
-				position.ypos = position.ypos_prev;
-			}
-		}
 		if (g.terminate)
 			break;
 
