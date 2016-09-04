@@ -86,10 +86,11 @@ enum {
 };
 
 static int colours[] = {
-	BLUE_CYAN,
+	WHITE_CYAN,
 	WHITE_GREEN,
 	WHITE_YELLOW,
 	WHITE_RED,
+	WHITE_BLUE,
 };
 
 /*
@@ -104,7 +105,8 @@ typedef struct blk {
 	struct blk	*list_next;
 	struct blk	*hash_next;
 	blkaddr_t	addr;
-	uint16_t	count;
+	uint32_t	count;
+	uint32_t	age;
 } blk_t;
 
 /*
@@ -152,6 +154,21 @@ static inline void banner(const int y)
 	mvwprintw(g.mainwin, y, 0, "%*s", COLS, "");
 }
 
+static int trace_block_enable(const int enable)
+{
+	FILE *fp;
+
+	if (enable < 0 || enable > 1)
+		return -1;
+
+	fp = fopen("/sys/kernel/debug/tracing/events/block/enable", "w");
+	if (!fp)
+		return -1;
+	fprintf(fp, "%d\n", enable);
+	fclose(fp);
+
+	return 0;
+}
 
 static inline size_t blk_hash(const blkaddr_t addr)
 {
@@ -235,8 +252,8 @@ static blk_t *blk_inc_count(const blkaddr_t addr)
 			return NULL;
 	}
 	pthread_mutex_lock(&g.mutex);
-	blk->count = (blk->count < 0x00ff) ?
-		blk->count + 64 : 0x00ff;
+	blk->count++;
+	blk->age = 64;
 	pthread_mutex_unlock(&g.mutex);
 
 	return blk;
@@ -250,8 +267,8 @@ static void blks_age(void)
 	while (blk) {
 		blk_t *blk_list_next = blk->list_next;
 
-		blk->count--;
-		if (blk->count == 0) {
+		blk->age--;
+		if (blk->age <= 0) {
 			blk_hash_unlink(blk);
 
 			if (blk_prev == NULL) {
@@ -273,20 +290,22 @@ static void blks_dump(position_t *position)
 	blk_t *blk = g.blk_list;
 	const size_t nblocks = position->xmax * position->ymax;
 	double blks_per_map = (float)g.nblocks / (float)nblocks;
-	double  map[nblocks];
+	uint32_t map_age[nblocks];
+	uint32_t map_count[nblocks];
+	uint32_t max_count = 0;
 	int x, y;
 	size_t i;
-	float max = 0.0;
 
-	for (i = 0; i < nblocks; i++)
-		map[i] = 0.0;
+	memset(map_age, 0, sizeof(map_age));
+	memset(map_count, 0, sizeof(map_count));
 
 	while (blk) {
 		size_t posn = (size_t)((double)blk->addr / blks_per_map);
 		if (posn < nblocks) {
-			map[posn] += (float)blk->count;
-			if (map[posn] > max)
-				max = map[posn];
+			map_age[posn] |= blk->age;
+			map_count[posn] += blk->count;
+			if (map_count[posn] > max_count)
+				max_count = map_count[posn];
 		}
 		blk = blk->list_next;
 	}
@@ -294,18 +313,15 @@ static void blks_dump(position_t *position)
 	wattrset(g.mainwin, COLOR_PAIR(WHITE_BLUE));
 	for (i = 0, y = 0; y < position->ymax; y++) {
 		for (x = 0; x < position->xmax; x++) {
-			float v = map[i] / blks_per_map;
-			uint16_t val = (uint16_t)v;
-			int colour = 0;
-			if (v > 0.0) {
-				val = 1;
-				colour = 1;
+			char ch = '.';
+			int colour = 4;
+			if (map_age[i]) {
+				colour = (int)(3.999 * (float)map_count[i] / (float)max_count);
+				ch = 'W';
+				
 			}
-			if (colour > 3) colour = 3;
-			if (colour < 0) colour = 0;
 			wattrset(g.mainwin, COLOR_PAIR(colours[colour]));
-			mvwprintw(g.mainwin, y + 1, x, "%c",
-				val == 0 ? '-' : ' ');
+			mvwprintw(g.mainwin, y + 1, x, "%c", ch);
 			i++;
 		}
 	}
@@ -322,17 +338,18 @@ static void *reader_thread(void *arg)
 	char buffer[512];
 
 	/* jbd2/sda3-8-629   [001] .... 64723.852280: block_dirty_buffer: 8,3 sector=38797433 size=4096 */
-
+	/*         cat-21706 [003] .... 46942.324026: block_getrq: 8,0 R 103233032 + 512 [cat] */
+	 
 	while (fgets(buffer, sizeof(buffer), g.fp)) {
 		char func[128];
 		unsigned int major, minor;
 		uint64_t sector;
 
-		sscanf(buffer, "%*s %*s %*s %*f: %s %d,%d sector=%" SCNu64, 
-			func, &major, &minor, &sector);
-
-		if (major == MAJOR(g.dev) && minor == MINOR(g.dev)) {
-			blk_inc_count(sector);
+		if (sscanf(buffer, "%*s %*s %*s %*f: %s %d,%d sector=%" SCNu64, 
+			func, &major, &minor, &sector) == 4) {
+			if (major == MAJOR(g.dev) && minor == MINOR(g.dev)) {
+				blk_inc_count(sector);
+			}
 		}
 	}
 	g.terminate = true;
@@ -509,6 +526,7 @@ int main(int argc, char **argv)
 
 	pthread_mutex_init(&g.mutex, NULL);
 
+
 	g.fp = fopen("/sys/kernel/debug/tracing/trace_pipe", "r");
 	if (!g.fp) {
 		fprintf(stderr, "cannot open trace pipe\n");
@@ -538,8 +556,6 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	g.nblocks = 191246996;
-
 	initscr();
 	start_color();
 	cbreak();
@@ -565,10 +581,11 @@ int main(int argc, char **argv)
 	memset(&position, 0, sizeof(position));
 	update_xymax(&position);
 
+	trace_block_enable(1);
+
 	for (;;) {
 		int ch, blink_attrs;
 		char cursor_ch;
-		float percent;
 
 
 		/*
@@ -630,8 +647,6 @@ int main(int argc, char **argv)
 			const position_t *pc = &position;
 			const index_t cursor_index = data_index +
 				(pc->xpos + (pc->ypos * pc->xmax));
-			percent = (g.nblocks > 0) ?
-				100.0 * cursor_index / g.nblocks : 100;
 
 			/* Memory may have shrunk, so check this */
 			if (cursor_index >= (index_t)g.nblocks) {
@@ -660,10 +675,10 @@ int main(int argc, char **argv)
 		wattrset(g.mainwin, COLOR_PAIR(WHITE_BLUE) | A_BOLD);
 		banner(0);
 
-		mvwprintw(g.mainwin, 0, 0, "Blockmon: %" PRIu64 " blocks @ "
+		mvwprintw(g.mainwin, 0, 0, "Blockmon: Dev: %d:%x %" PRIu64 " blocks @ "
 			"%" PRIu32 " bytes per block",
+			MAJOR(g.dev), MINOR(g.dev),
 			g.nblocks, g.blksize);
-		mvwprintw(g.mainwin, 0, COLS - 8, " %6.1f%%", percent);
 
 		blks_dump(&position);
 		blks_age();
@@ -756,19 +771,19 @@ force_ch:
 			position.ypos = 0;
 		}
 		{
-		const position_t *pc = &position;
-		const index_t cursor_index = data_index +
-			(pc->xpos + (pc->ypos * pc->xmax));
-		const blkaddr_t addr =
-			(cursor_index >= (index_t)g.nblocks) ?
-				g.nblocks :
-				(blkaddr_t)data_index + (position.xpos + (position.ypos * position.xmax));
+			const position_t *pc = &position;
+			const index_t cursor_index = data_index +
+				(pc->xpos + (pc->ypos * pc->xmax));
+			const blkaddr_t addr =
+				(cursor_index >= (index_t)g.nblocks) ?
+					g.nblocks :
+					(blkaddr_t)data_index + (position.xpos + (position.ypos * position.xmax));
 
-		if (addr >= g.nblocks) {
-			data_index = prev_data_index;
-			position.xpos = position.xpos_prev;
-			position.ypos = position.ypos_prev;
-		}
+			if (addr >= g.nblocks) {
+				data_index = prev_data_index;
+				position.xpos = position.xpos_prev;
+				position.ypos = position.ypos_prev;
+			}
 		}
 		if (g.terminate)
 			break;
@@ -782,6 +797,8 @@ force_ch:
 	delwin(g.mainwin);
 
 terminate:
+	trace_block_enable(0);
+
 	//(void)pthread_join(reader, NULL);
 	(void)fclose(g.fp);
 	if (g.curses_started) {
