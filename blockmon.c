@@ -449,7 +449,7 @@ int main(int argc, char **argv)
 	udelay = DEFAULT_UDELAY;
 
 	for (;;) {
-		int c = getopt(argc, argv, "ad:hp:rt:vz:");
+		int c = getopt(argc, argv, "d:h");
 
 		if (c == -1)
 			break;
